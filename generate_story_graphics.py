@@ -32,6 +32,8 @@ PALETTE = {
     'panel_soft': (20, 26, 40, 150),
 }
 
+SPORT_SPREAD_ORDER = ['Alpine Ski','Backcountry Ski','E-Bike Ride','Hike','Kayaking','Ride','Run','Snowshoe','Swim','Walk']
+FOOT_BASED_SPORTS = {'Run', 'Hike', 'Snowshoe', 'Walk'}
 
 def font(path: str, size: int):
     return ImageFont.truetype(path, size=size)
@@ -87,6 +89,10 @@ def feet_text(elev_m: str) -> str:
         return ''
 
 
+def mph_label(mph: float) -> str:
+    return f"{mph:.1f} mph" if mph < 10 else f"{mph:.0f} mph"
+
+
 def pace_text(mph: float) -> str:
     if mph <= 0:
         return '--:-- /mi'
@@ -97,6 +103,19 @@ def pace_text(mph: float) -> str:
         minutes += 1
         seconds = 0
     return f"{minutes}:{seconds:02d} /mi"
+
+
+def swim_pace_text(mph: float) -> str:
+    if mph <= 0:
+        return '--:-- /100yd'
+    yards_per_hour = mph * 1760.0
+    minutes_per_100yd = 60.0 * 100.0 / yards_per_hour
+    minutes = int(minutes_per_100yd)
+    seconds = int(round((minutes_per_100yd - minutes) * 60))
+    if seconds == 60:
+        minutes += 1
+        seconds = 0
+    return f"{minutes}:{seconds:02d} /100yd"
 
 
 def wrap(draw: ImageDraw.ImageDraw, text: str, text_font, width: int) -> List[str]:
@@ -214,24 +233,27 @@ def card_ride(stats: Dict, activity_rows: Dict[str, Dict[str, str]]) -> Image.Im
 
 
 def card_mix(stats: Dict, activity_rows: Dict[str, Dict[str, str]]) -> Image.Image:
-    sports = by_sport(stats['results'])
-    run = first_for_sport(stats['results'], 'Run')
+    sport_lookup = {item['sport_type']: item for item in by_sport(stats['results'])}
     export_dir = Path(stats['export_dir'])
     image = add_photo_treatment(cover_image(export_dir / 'media/DADB4C40-4D06-4006-A991-C56D3C89C602.jpg'), PALETTE['teal'])
     draw = ImageDraw.Draw(image, 'RGBA')
     add_story_frame(draw)
 
-    card_y = 980
-    box_h = 146
-    giant_font = font(TITLE_FONT, 68)
-    metric_font = font(TITLE_FONT, 50)
-    for idx, item in enumerate(sports[:5]):
-        top = card_y + idx * (box_h + 18)
-        draw.rounded_rectangle((PADDING, top, WIDTH - PADDING, top + box_h), radius=28, fill=(12, 17, 28, 132))
-        ghost = PALETTE['gold'] + (80,) if idx == 0 else (255, 255, 255, 54)
-        draw.text((PADDING + 20, top + 34), item['sport_type'].upper(), font=giant_font, fill=ghost)
-        metric = pace_text(item['top_speed_mph']) if item['sport_type'] == 'Run' else f"{item['top_speed_mph']:.2f} mph"
-        draw.text((WIDTH - PADDING - 26, top + 44), metric, anchor='ra', font=metric_font, fill=PALETTE['ink'])
+    selected = [sport_lookup[sport] for sport in SPORT_SPREAD_ORDER if sport in sport_lookup]
+    selected.sort(key=lambda item: item['top_speed_mph'], reverse=True)
+    card_y = 560
+    box_h = 112
+    gap = 10
+    giant_font = font(TITLE_FONT, 54)
+    metric_font = font(TITLE_FONT, 36)
+    for idx, item in enumerate(selected):
+        top = card_y + idx * (box_h + gap)
+        draw.rounded_rectangle((PADDING, top, WIDTH - PADDING, top + box_h), radius=24, fill=(12, 17, 28, 128))
+        ghost = PALETTE['gold'] + (86,) if idx == 0 else (255, 255, 255, 58)
+        draw.text((PADDING + 18, top + 28), item['sport_type'].upper(), font=giant_font, fill=ghost)
+        primary = mph_label(item['top_speed_mph'])
+        right_x = WIDTH - PADDING - 22
+        draw.text((right_x, top + 22), primary, anchor='ra', font=metric_font, fill=PALETTE['ink'])
 
     return image
 
