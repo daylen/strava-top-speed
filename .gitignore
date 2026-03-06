@@ -3,3 +3,4 @@ export_*/
 results/
 .env
 .DS_Store
+.vendor/
