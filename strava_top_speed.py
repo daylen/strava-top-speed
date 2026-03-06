@@ -4,7 +4,6 @@ import csv
 import gzip
 import json
 import math
-import os
 import sys
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
@@ -41,6 +40,8 @@ TRACK_SPIKE_COUNT_LIMIT = 6
 WINDOW_SPIKE_DELTA_MPH = 10.0
 WINDOW_SPIKE_MIN_COUNT = 3
 WINDOW_SPIKE_MAX_EXCESS_MPH = 20.0
+CACHE_VERSION = 1
+CACHE_PATH = Path(".speed_cache.json")
 
 
 class ExportError(RuntimeError):
@@ -492,6 +493,40 @@ def build_result(row: Dict[str, str], activity_date: datetime, top_speed_mps: fl
     }
 
 
+def load_cache() -> Dict[str, Dict[str, Any]]:
+    if not CACHE_PATH.exists():
+        return {}
+    try:
+        payload = json.loads(CACHE_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if payload.get("version") != CACHE_VERSION:
+        return {}
+    cache = payload.get("entries")
+    return cache if isinstance(cache, dict) else {}
+
+
+def save_cache(cache: Dict[str, Dict[str, Any]]) -> None:
+    payload = {"version": CACHE_VERSION, "entries": cache}
+    CACHE_PATH.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def cache_key(export_dir: Path, row: Dict[str, str], window_seconds: int) -> str:
+    relative_file = row.get("Filename") or ""
+    file_path = export_dir / relative_file if relative_file else None
+    stat = file_path.stat() if file_path and file_path.exists() else None
+    return "|".join(
+        [
+            str(window_seconds),
+            row.get("Activity ID") or "",
+            relative_file,
+            str(int(stat.st_mtime)) if stat else "",
+            str(stat.st_size) if stat else "",
+            row.get("Max Speed") or "",
+        ]
+    )
+
+
 def iter_candidate_rows(
     export_dir: Path,
     after: Optional[datetime],
@@ -604,6 +639,75 @@ def load_results_lazy_single_sport(
     return results[:top_n], excluded, scanned, len(candidates)
 
 
+def load_results_lazy_all_sports(
+    export_dir: Path,
+    after: Optional[datetime],
+    before: Optional[datetime],
+    sport_filters: Optional[Set[str]],
+    caps_mph: Dict[str, float],
+    window_seconds: int,
+    exclude_likely_strava_app: bool,
+    top_n: int,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], int, int]:
+    candidates = list(iter_candidate_rows(export_dir, after, before, sport_filters, exclude_likely_strava_app))
+    candidates.sort(key=lambda row: float(row["Max Speed"]), reverse=True)
+
+    cache = load_cache()
+    cache_dirty = False
+    results: List[Dict[str, Any]] = []
+    excluded: List[Dict[str, Any]] = []
+    best_by_sport: Dict[str, float] = {}
+    verified = 0
+
+    for row in candidates:
+        summary_speed_mps = float(row["Max Speed"])
+        sport = (row.get("Activity Type") or "Unknown").strip()
+        current_best_for_sport = best_by_sport.get(sport, -1.0)
+        current_global_threshold = results[top_n - 1]["top_speed_mps"] if len(results) >= top_n else -1.0
+
+        # If this activity cannot improve its sport leader and cannot enter the global top N, skip verification.
+        if summary_speed_mps <= current_best_for_sport and summary_speed_mps <= current_global_threshold:
+            continue
+
+        key = cache_key(export_dir, row, window_seconds)
+        cached = cache.get(key)
+        if cached:
+            top_speed_mps = float(cached["top_speed_mps"])
+            source = str(cached["source"])
+        else:
+            verified += 1
+            top_speed_mps, source = verify_speed(export_dir, row.get("Filename") or "", summary_speed_mps, window_seconds)
+            cache[key] = {"top_speed_mps": top_speed_mps, "source": source}
+            cache_dirty = True
+
+        activity_date = parse_activity_date(row["Activity Date"])
+        result = build_result(row, activity_date, top_speed_mps, summary_speed_mps, source)
+
+        if source.startswith("excluded:"):
+            result["excluded_reason"] = source.split(":", 1)[1]
+            excluded.append(result)
+            continue
+
+        is_glitch, reason = is_glitch_candidate(result, caps_mph)
+        if is_glitch:
+            result["excluded_reason"] = reason
+            excluded.append(result)
+            continue
+
+        if result["top_speed_mps"] > current_best_for_sport:
+            best_by_sport[sport] = result["top_speed_mps"]
+        results.append(result)
+
+    if cache_dirty:
+        save_cache(cache)
+
+    deduped: Dict[Any, Dict[str, Any]] = {}
+    for result in sorted(results, key=lambda item: item["top_speed_mps"], reverse=True):
+        deduped[result["id"]] = result
+    final_results = list(deduped.values())
+    return final_results, excluded, verified, len(candidates)
+
+
 def summarize(results: List[Dict[str, Any]], top_n: int) -> str:
     if not results:
         return "No matching activities found."
@@ -662,10 +766,10 @@ def main() -> int:
         sport_filters = normalize_sport_filters(args.sports)
         max_mph_overrides = parse_max_mph_overrides(args.max_mph)
         glitch_caps = build_glitch_caps(args.disable_glitch_filter, max_mph_overrides)
-        used_lazy_verification = bool(sport_filters and len(sport_filters) == 1)
+        used_lazy_verification = True
         scanned_candidates = None
         total_candidates = None
-        if used_lazy_verification:
+        if sport_filters and len(sport_filters) == 1:
             results, excluded, scanned_candidates, total_candidates = load_results_lazy_single_sport(
                 export_dir,
                 after,
@@ -677,7 +781,7 @@ def main() -> int:
                 args.top,
             )
         else:
-            results, excluded = load_results(
+            results, excluded, scanned_candidates, total_candidates = load_results_lazy_all_sports(
                 export_dir,
                 after,
                 before,
@@ -685,6 +789,7 @@ def main() -> int:
                 glitch_caps,
                 args.window_seconds,
                 args.exclude_likely_strava_app,
+                args.top,
             )
     except (ExportError, FileNotFoundError, ValueError, ET.ParseError) as exc:
         print(str(exc), file=sys.stderr)
@@ -692,8 +797,7 @@ def main() -> int:
 
     print(f"Using export: {export_dir}")
     print(f"Matched {len(results)} activities.")
-    if used_lazy_verification:
-        print(f"Scanned {scanned_candidates} of {total_candidates} candidates using lazy verification.")
+    print(f"Scanned {scanned_candidates} of {total_candidates} candidates using lazy verification.")
     if glitch_caps:
         print(f"Excluded {len(excluded)} glitch candidates using sport-specific max mph caps.")
     print()
